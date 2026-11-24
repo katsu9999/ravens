@@ -1,0 +1,114 @@
+# Ravens 用の公開（https://katsu9999.github.io/ravens/）
+#
+# アプリ本体は katsu9999/gg-tennis。ここではコードを持たず、GG で公開に成功した
+# 版（main）を「Ravens 専用」の設定でビルドして公開するだけ。データは同じ
+# Supabase の Ravens 分（GG とは混ざらない）。
+#
+# - 30分ごとに gg-tennis の最新公開版を確認し、新しければ公開し直す
+# - すぐ反映したいときは Actions → "Deploy Ravens" → Run workflow
+name: Deploy Ravens
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "7,37 * * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: katsu9999/gg-tennis
+  SITE_URL: https://katsu9999.github.io/ravens/
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GG 側で公開（テスト込み）に成功した最新の版だけを使う
+          sha=$(gh api "repos/$SOURCE_REPO/actions/workflows/deploy.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0].head_sha')
+          test -n "$sha" && test "$sha" != "null"
+          deployed=$(curl -fsS "${SITE_URL}version.txt" 2>/dev/null || true)
+          echo "source=$sha deployed=$deployed"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" != "schedule" ] || [ "$sha" != "$deployed" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Keep the schedule enabled
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # 60日コミットが無いと定期実行が止まるため、有効化 API を叩き直す
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/deploy.yml/enable" || true
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+
+      - name: Source must support club-only builds
+        # 古い版を Ravens 設定でビルドすると GG として動いてしまうので止める
+        run: grep -q "VITE_FIXED_CLUB" src/flavor.ts
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_BASE_URL: /ravens/
+          VITE_FIXED_CLUB: ravens
+          VITE_APP_NAME: Ravens — Court Shuffle
+          VITE_APP_SHORT_NAME: Ravens
+        run: |
+          test -n "$VITE_SUPABASE_URL" && test -n "$VITE_SUPABASE_ANON_KEY"
+          npm run build
+
+      - name: SPA fallback and version stamp
+        run: |
+          cp dist/index.html dist/404.html
+          echo "${{ needs.check.outputs.sha }}" > dist/version.txt
+
+      - uses: actions/configure-pages@v4
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
